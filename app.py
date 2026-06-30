@@ -11,6 +11,10 @@ import yfinance as yf
 # =====================================================================
 st.set_page_config(layout="wide", page_title="Alpha Trading Desk")
 
+# ── Safe defaults for cross-tab state ────────────────────────────────
+if "xs_list" not in st.session_state:
+    st.session_state.xs_list = []
+
 if "ledger" not in st.session_state:
     st.session_state.ledger = {
         "cash": 100_000.0,
@@ -735,6 +739,7 @@ with tab_cross:
         )
         xs_tickers_raw = st.text_area("Universe (NASDAQ-100)", _NQ100_DEFAULT, height=120)
         xs_list = [t.strip().upper() for t in xs_tickers_raw.split(",") if t.strip()]
+        st.session_state.xs_list = xs_list
         xs_lookback = st.slider("Momentum Lookback (Bars)", 5, 60, 20, key="xs_lb")
         xs_top_n    = st.slider("Long/Short Tail N", 1, 10, 5, key="xs_tn")
     with c_col2:
@@ -770,7 +775,7 @@ with tab_supply:
     h_col1, h_col2 = st.columns([1, 3])
 
     with h_col1:
-        spy_floor_pct = st.slider("SPY Floor (%)", 30, 80, 60, step=5, key="spy_floor") / 100.0
+        spy_floor_pct = st.slider("SPY Floor (%)", 10, 80, 35, step=5, key="spy_floor") / 100.0
         h_top_n       = st.slider("Active Top-N (NQ100)", 1, 10, 3, key="h_topn")
         h_ma_window   = st.slider("MA Regime Window (Days)", 50, 300, 200, step=25, key="h_ma")
         active_pct    = 1.0 - spy_floor_pct
@@ -854,13 +859,14 @@ with tab_action:
     st.caption("Signals refresh every 15 minutes. Based on 60% SPY + 40% NQ100 Top-3 Monthly 12-1 Momentum strategy.")
 
     # Sidebar overrides for action panel
-    ap_spy_floor = st.sidebar.slider("Action Panel: SPY Floor (%)", 30, 80, 60, step=5, key="ap_spy") / 100.0
+    ap_spy_floor = st.sidebar.slider("Action Panel: SPY Floor (%)", 10, 80, 35, step=5, key="ap_spy") / 100.0
     ap_top_n     = st.sidebar.slider("Action Panel: Top-N", 1, 7, 3, key="ap_topn")
     ap_ma        = st.sidebar.slider("Action Panel: MA Window", 50, 300, 200, step=25, key="ap_ma")
     ap_spy_ticker = st.sidebar.text_input("SPY Proxy", "SPY", key="ap_spy_tkr").strip().upper()
 
     # Fetch live signal
-    universe_for_signal = tuple(sorted(xs_list)) if xs_list else tuple()
+    _xs = st.session_state.get("xs_list", xs_list if "xs_list" in dir() else [])
+    universe_for_signal = tuple(sorted(_xs)) if _xs else tuple()
     if not universe_for_signal:
         st.warning("Define the NQ100 universe in the Cross-Sectional tab first.")
     else:
@@ -904,9 +910,23 @@ with tab_action:
             else:
                 r_col1.error(f"### 🔴 BEAR REGIME → CASH")
             r_col2.metric("NQ100 EW vs 200d MA", f"{sig['ma_margin']:+.2f}%",
-                          help="How far above/below the trend filter threshold")
-            r_col3.metric("Days in Current Regime", str(days_in_regime))
-            r_col4.metric("Signal As-Of", sig["as_of"])
+                          help="How far above/below the 200d MA")
+            spy_bull_flag = sig.get("spy_bull", True)
+            breadth_val   = sig.get("breadth", 0)
+            breadth_ok    = sig.get("breadth_ok", True)
+            r_col3.metric(
+                "SPY vs 200d MA",
+                "✅ Above" if spy_bull_flag else "🔴 Below",
+                help="SPY must also be above its 200d MA for bull regime"
+            )
+            r_col4.metric(
+                "Breadth",
+                f"{breadth_val*100:.0f}%",
+                delta="✅ ≥40%" if breadth_ok else "🔴 <40% threshold",
+                delta_color="normal" if breadth_ok else "inverse",
+                help="% of NQ100 with positive 11-1 weekly score. Must be ≥40%."
+            )
+            st.caption(f"Signal as-of: {sig['as_of']} · Next rebalance: {sig['days_to_rebalance']}d (Friday close → Monday open)")
 
             st.divider()
 
@@ -989,6 +1009,10 @@ with tab_action:
 
             # ── SECTION 4: ACTION CHECKLIST ──────────────────────────
             st.markdown("#### 📋 Action Checklist")
+            st.caption(
+                "System E: Weekly rebalance (Friday close → Monday open). "
+                "Stop-loss: if any position drops >10% from entry price, sell at next open and replace with next-best ranked stock."
+            )
 
             if circuit_on:
                 st.error("⛔ Circuit breaker active — no new orders permitted. Exit positions to reduce risk.")
@@ -1002,7 +1026,7 @@ with tab_action:
                 else:
                     if regime == "BEAR":
                         st.warning(
-                            "🔴 **BEAR REGIME ACTIVE** — The active momentum sleeve should be in cash. "
+                            "🔴 **BEAR REGIME ACTIVE** — The active momentum sleeve should be in cash (System E: 10% SPY + 90% cash). "
                             "Your only equity holding should be the SPY floor. "
                             "Sell all momentum positions and hold cash for the active sleeve."
                         )
