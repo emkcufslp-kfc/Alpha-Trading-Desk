@@ -149,6 +149,8 @@ def compute_live_signal(
     # ── Weekly 11-1 momentum (System E: 44-week - 4-week skip) ───────
     wp = nq_px.resample("W-FRI").last()
     LOOKBACK_WK, SKIP_WK = 44, 4
+    breadth = 0.0
+    breadth_ok = False
     if len(wp) < LOOKBACK_WK + 2:
         top_tickers = []
         mom_table   = pd.Series(dtype=float)
@@ -271,7 +273,7 @@ def compile_performance_metrics(
         "Sharpe": "0.00", "Sortino": "0.00",
         "Max Drawdown": "0.00%", "Calmar": "0.00",
     }
-    if len(daily_returns) == 0 or daily_returns.std() == 0:
+    if len(daily_returns) == 0 or (daily_returns.std() == 0 or pd.isna(daily_returns.std())):
         return _empty
 
     total_ret = (equity_curve.iloc[-1] - 1) * 100
@@ -707,7 +709,7 @@ st.markdown("---")
 
 st.sidebar.header("Global Matrix Boundary")
 start_input = st.sidebar.date_input("Start Boundary", datetime.date(2023, 1, 1))
-end_input   = st.sidebar.date_input("End Boundary",   datetime.date(2026, 6, 1))
+end_input   = st.sidebar.date_input("End Boundary",   datetime.date.today())
 st.sidebar.markdown("---")
 st.sidebar.header("Risk Management")
 dd_threshold = st.sidebar.slider("Drawdown Circuit Breaker (%)", 5, 40, 15, key="dd_cb") / 100.0
@@ -767,9 +769,9 @@ with tab_cross:
 
 # ─── TAB 2: HYBRID MOMENTUM STRATEGY ─────────────────────────────────
 with tab_supply:
-    st.subheader("Hybrid Momentum: SPY Floor + NQ100 Monthly 12-1 Momentum")
+    st.subheader("Hybrid Strategy: SPY Floor + NQ100 Monthly 12-1 Momentum (Legacy Comparison)")
     st.caption(
-        "Always-on SPY sleeve provides a diversification floor. "
+        "Legacy monthly 12-1 system for comparison. System E (Action Panel) upgrades this to weekly 11-1 + dual regime + stop-loss. "
         "Active sleeve rotates monthly into top-N NQ100 momentum stocks (bull) or cash (bear)."
     )
     h_col1, h_col2 = st.columns([1, 3])
@@ -789,7 +791,7 @@ with tab_supply:
         spy_ticker_input = st.text_input("SPY Proxy Ticker", "SPY").strip().upper()
 
     with h_col2:
-        if "xs_prices" in dir() and not xs_prices.empty:
+        if "xs_prices" in locals() and not xs_prices.empty:
             spy_data = fetch_universe_clean(tuple([spy_ticker_input]), start_input, end_input)
 
             if not spy_data.empty and spy_ticker_input in spy_data.columns:
@@ -853,10 +855,111 @@ with tab_supply:
                             fillcolor="rgba(255,51,51,0.07)", line_width=0)
                         bear_start = None
 
+                fig_h.update_layout(
+                    template="plotly_dark",
+                    title="Hybrid Momentum — SPY Floor + Monthly NQ100 Active Sleeve",
+                    height=420,
+                    legend=dict(orientation="h", y=1.02),
+                )
+                st.plotly_chart(fig_h, use_container_width=True)
+
+                # Quarterly holdings table
+                st.markdown("##### 📋 Monthly Momentum Holdings")
+                qh_rows = []
+                for qd, row in rank_m.iterrows():
+                    valid = row.dropna()
+                    selected = valid[valid <= h_top_n].sort_values().index.tolist()
+                    if selected:
+                        qh_rows.append({"Date": str(qd)[:10], "Holdings": ", ".join(selected)})
+                if qh_rows:
+                    st.dataframe(pd.DataFrame(qh_rows).tail(12), use_container_width=True, hide_index=True)
+            else:
+                st.warning("SPY price data unavailable.")
+        else:
+            st.info("Load the NQ100 universe in the Cross-Sectional tab first.")
+
+# ─── TAB 3: PORTFOLIO LEDGER ──────────────────────────────────────────
+with tab_ledger:
+    st.subheader("📒 Portfolio Account Ledger")
+    st.caption("Track your paper-trading account. Transactions executed via the Action Panel are logged here.")
+
+    l1, l2, l3 = st.columns(3)
+    _lnav = st.session_state.ledger["cash"] + sum(
+        st.session_state.ledger["positions"].get(t, 0) * 0
+        for t in st.session_state.ledger["positions"]
+    )
+    l1.metric("Cash Balance", f"${st.session_state.ledger['cash']:,.0f}")
+    l2.metric("Open Positions", len(st.session_state.ledger["positions"]))
+    l3.metric("Transactions", len(st.session_state.ledger["history"]))
+
+    st.markdown("##### Open Positions")
+    if st.session_state.ledger["positions"]:
+        pos_rows = [{"Ticker": t, "Qty": q} for t, q in st.session_state.ledger["positions"].items() if q > 0]
+        st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No open positions.")
+
+    st.markdown("##### Transaction History")
+    if st.session_state.ledger["history"]:
+        hist_df = pd.DataFrame(st.session_state.ledger["history"])
+        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No transactions recorded yet. Use the Action Panel to execute trades.")
+
+    if st.button("🔄 Reset Account to $100,000 Cash"):
+        st.session_state.ledger = {"cash": 100_000.0, "positions": {}, "history": []}
+        st.session_state.nav_peak = 100_000.0
+        st.session_state.cost_basis = {}
+        st.success("Account reset.")
+        st.rerun()
+
+# ─── TAB 4: EXECUTION CONTROL CENTER ─────────────────────────────────
+with tab_execution:
+    st.subheader("🎛️ Execution Control Center")
+    st.caption("Manual trade entry and account management. For strategy-driven signals, use the ⚡ Action Panel.")
+
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        st.markdown("##### Manual Trade Entry")
+        mt_ticker = st.text_input("Ticker", key="mt_tkr").strip().upper()
+        mt_action = st.radio("Action", ["BUY", "SELL"], horizontal=True, key="mt_act")
+        mt_qty    = st.number_input("Quantity (shares)", min_value=1, value=1, key="mt_qty")
+        mt_price  = st.number_input("Price per share ($)", min_value=0.01, value=100.0, step=0.01, key="mt_px")
+        if st.button("Submit Trade", key="mt_submit", use_container_width=True):
+            if mt_ticker:
+                ok = log_transaction(mt_action, mt_ticker, int(mt_qty), float(mt_price))
+                if ok:
+                    st.success(f"{mt_action} {mt_qty}x {mt_ticker} @ ${mt_price:.2f} logged.")
+                    st.rerun()
+                else:
+                    st.error("Trade rejected — insufficient cash or shares.")
+            else:
+                st.warning("Enter a ticker symbol.")
+
+    with ec2:
+        st.markdown("##### Cost Basis Tracker")
+        if st.session_state.cost_basis:
+            cb_rows = []
+            for t, cb in st.session_state.cost_basis.items():
+                if cb["total_qty"] > 0:
+                    avg = cb["total_cost"] / cb["total_qty"]
+                    cb_rows.append({"Ticker": t, "Qty": cb["total_qty"],
+                                    "Avg Cost": f"${avg:.2f}",
+                                    "Total Cost": f"${cb['total_cost']:,.0f}"})
+            if cb_rows:
+                st.dataframe(pd.DataFrame(cb_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No cost basis tracked yet.")
+
+        st.markdown("##### Circuit Breaker Status")
+        cb_status = "🔴 ACTIVE" if st.session_state.circuit_breaker else "🟢 Clear"
+        st.metric("Circuit Breaker", cb_status)
+        st.caption(f"Drawdown threshold: {dd_threshold:.0%}. Managed in Action Panel.")
+
 # ─── TAB 5: LIVE ACTION PANEL ─────────────────────────────────────────
 with tab_action:
     st.subheader("⚡ Live Action Panel — What to Do Right Now")
-    st.caption("Signals refresh every 15 minutes. Based on 60% SPY + 40% NQ100 Top-3 Monthly 12-1 Momentum strategy.")
+    st.caption("Signals refresh every 15 minutes. System E: 35% SPY + 65% active (top-3 weekly 11-1 momentum). Daily regime T+1 exit. Stop-loss −10% per position.")
 
     # Sidebar overrides for action panel
     ap_spy_floor = st.sidebar.slider("Action Panel: SPY Floor (%)", 10, 80, 35, step=5, key="ap_spy") / 100.0
@@ -1128,17 +1231,17 @@ with tab_action:
             st.divider()
 
             # ── SECTION 6: TOP-N MOMENTUM LEADERBOARD ────────────────
-            st.markdown("#### 📊 NQ100 Momentum Leaderboard (12-1 Month)")
+            st.markdown("#### 📊 NQ100 Momentum Leaderboard (Weekly 11-1)")
             if not sig["mom_table"].empty:
                 mom_display = sig["mom_table"].head(15).reset_index()
-                mom_display.columns = ["Ticker", "12-1 Mo Momentum"]
+                mom_display.columns = ["Ticker", "11-1 Wk Momentum"]
                 mom_display["12-1 Mo Momentum"] = mom_display["12-1 Mo Momentum"].map("{:.2%}".format)
                 mom_display["Rank"] = range(1, len(mom_display) + 1)
                 mom_display["In Portfolio"] = mom_display["Ticker"].apply(
                     lambda t: "⭐ Selected" if t in top_tickers else
                               ("📍 Held" if t in st.session_state.ledger["positions"] else "—")
                 )
-                st.dataframe(mom_display[["Rank","Ticker","12-1 Mo Momentum","In Portfolio"]],
+                st.dataframe(mom_display[["Rank","Ticker","11-1 Wk Momentum","In Portfolio"]],
                              use_container_width=True, hide_index=True)
 
             st.divider()
