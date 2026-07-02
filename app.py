@@ -823,6 +823,137 @@ def run_system_e_backtest(
 
 
 # =====================================================================
+# 4L. TIMING SENSITIVITY BACKTEST
+# =====================================================================
+@st.cache_data(ttl=3600)
+def run_timing_comparison(
+    nq_tickers: tuple,
+    spy_ticker: str = "SPY",
+    start=None,
+    end=None,
+    spy_floor: float = 0.35,
+    top_n: int = 3,
+    ma_window: int = 200,
+    breadth_threshold: float = 0.40,
+) -> pd.DataFrame:
+    """
+    Test 4 entry-timing combinations for the weekly 11-1 system.
+
+    The key knobs are:
+      signal_freq : which weekday closes the signal week (W-FRI or W-MON)
+      entry_shift : how many *trading days* after the signal close before we enter
+                    1 = next trading day (Mon if signal=Fri, Tue if signal=Mon)
+                    2 = day after that  (Tue if signal=Fri, Wed if signal=Mon)
+
+    Combinations:
+      A  Fri close → Mon entry    (current default)
+      B  Fri close → Tue entry    (skip Monday gap)
+      C  Mon close → Tue entry    (signal after Monday resolves)
+      D  Mon close → Wed entry    (extra buffer)
+
+    Returns a DataFrame with one row per combination.
+    """
+    if start is None:
+        start = "2006-01-01"
+    if end is None:
+        end = datetime.date.today().isoformat()
+
+    all_tickers = list(nq_tickers) + ([spy_ticker] if spy_ticker not in nq_tickers else [])
+    raw = yf.download(all_tickers, start=str(start), end=str(end), progress=False)
+    if raw.empty:
+        return pd.DataFrame()
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        px = (raw.xs("Adj Close", axis=1, level=0)
+              if "Adj Close" in raw.columns.levels[0]
+              else raw.xs("Close", axis=1, level=0))
+    else:
+        px = raw[["Adj Close"]] if "Adj Close" in raw.columns else raw[["Close"]]
+    px = px.dropna(how="all")
+
+    nq_px  = px[[c for c in px.columns if c in nq_tickers]]
+    spy_px = px[spy_ticker] if spy_ticker in px.columns else None
+    if nq_px.empty or spy_px is None or len(nq_px) < ma_window:
+        return pd.DataFrame()
+
+    # Shared: daily dual regime (same for all combos)
+    eq_idx   = nq_px.mean(axis=1)
+    nq_ma    = eq_idx.rolling(ma_window, min_periods=ma_window // 2).mean()
+    spy_ma   = spy_px.rolling(ma_window, min_periods=ma_window // 2).mean()
+    nq_bull  = (eq_idx > nq_ma).astype(float).shift(1).fillna(0)
+    spy_bull = (spy_px > spy_ma).astype(float).shift(1).fillna(0)
+    dual_bull = nq_bull * spy_bull
+
+    nq_ret  = nq_px.pct_change()
+    spy_ret = spy_px.pct_change()
+    spy_alloc = dual_bull * spy_floor + (1 - dual_bull) * 0.10
+    active_pct = 1.0 - spy_floor
+
+    LOOKBACK_WK, SKIP_WK = 44, 4
+
+    combos = [
+        ("A: Fri→Mon (current)", "W-FRI", 1),
+        ("B: Fri→Tue (skip Mon)", "W-FRI", 2),
+        ("C: Mon→Tue (Mon signal)", "W-MON", 1),
+        ("D: Mon→Wed (Mon+buffer)", "W-MON", 2),
+    ]
+
+    rows = []
+    equity_curves = {}
+
+    for label, freq, entry_shift in combos:
+        wp = nq_px.resample(freq).last()
+        if len(wp) < LOOKBACK_WK + 2:
+            continue
+
+        mom = (wp.pct_change(periods=LOOKBACK_WK)
+               - wp.pct_change(periods=SKIP_WK)).dropna(how="all")
+
+        # No week-level shift here — we shift at the daily level instead
+        rank        = mom.rank(axis=1, ascending=False)
+        top_mask    = (rank <= top_n).astype(float) / top_n
+        breadth_ok  = ((mom > 0).sum(axis=1) / mom.shape[1] >= breadth_threshold).astype(float)
+
+        # Forward-fill to daily, then shift by entry_shift trading days
+        dw = top_mask.reindex(nq_px.index, method="ffill").fillna(0).shift(entry_shift).fillna(0)
+        db = breadth_ok.reindex(nq_px.index, method="ffill").fillna(0).shift(entry_shift).fillna(0)
+
+        active_on = dual_bull * db
+        active_w  = dw.multiply(active_on, axis=0)
+
+        strat_ret = spy_alloc * spy_ret + active_pct * (active_w * nq_ret).sum(axis=1)
+        eq = (1 + strat_ret.fillna(0)).cumprod()
+
+        # Metrics
+        n_years  = len(eq) / 252
+        cagr     = eq.iloc[-1] ** (1 / n_years) - 1 if n_years > 0 else 0
+        roll_max = eq.cummax()
+        dd       = (eq / roll_max - 1)
+        max_dd   = dd.min()
+        ann_vol  = strat_ret.std() * (252 ** 0.5)
+        sharpe   = (strat_ret.mean() * 252) / ann_vol if ann_vol > 0 else 0
+
+        # Monday-specific stats: avg return on Mondays
+        mon_mask = strat_ret.index.dayofweek == 0
+        avg_mon  = strat_ret[mon_mask].mean() * 100
+
+        rows.append({
+            "Combo":           label,
+            "CAGR":            f"{cagr:.2%}",
+            "MaxDD":           f"{max_dd:.2%}",
+            "Sharpe":          f"{sharpe:.3f}",
+            "Ann Vol":         f"{ann_vol:.2%}",
+            "Avg Mon Return":  f"{avg_mon:+.4f}%",
+            "_cagr":           cagr,
+            "_sharpe":         sharpe,
+            "_maxdd":          max_dd,
+        })
+        equity_curves[label] = eq
+
+    return pd.DataFrame(rows), equity_curves
+
+
+# =====================================================================
 # 5. STREAMLIT UI FRAMEWORK
 # =====================================================================
 
@@ -1329,6 +1460,64 @@ with tab_opt:
                          use_container_width=True, hide_index=True)
         else:
             st.warning("Grid search returned no results.")
+
+    st.divider()
+    st.markdown("##### Entry Timing Sensitivity Test")
+    st.caption(
+        "Same System E strategy, 4 entry-timing variants. "
+        "Tests whether skipping Monday's gap open (weekend noise) improves risk-adjusted returns."
+    )
+
+    timing_cols = st.columns(4)
+    timing_cols[0].markdown("**A: Fri close → Mon entry** (current)")
+    timing_cols[1].markdown("**B: Fri close → Tue entry** (skip Mon gap)")
+    timing_cols[2].markdown("**C: Mon close → Tue entry** (see Mon first)")
+    timing_cols[3].markdown("**D: Mon close → Wed entry** (Mon + buffer)")
+
+    if st.button("Run Timing Comparison", key="timing_test", use_container_width=True):
+        with st.spinner("Running 4 timing combinations... (~20 sec)"):
+            timing_result = run_timing_comparison(
+                NQ100_TICKERS, ap_spy_ticker, start_input, end_input,
+                spy_floor=ap_spy_floor, top_n=ap_top_n, ma_window=ap_ma,
+            )
+
+        if isinstance(timing_result, tuple) and len(timing_result) == 2:
+            t_df, t_curves = timing_result
+        else:
+            t_df, t_curves = pd.DataFrame(), {}
+
+        if not t_df.empty:
+            # Metrics table — highlight best in each column
+            display_df = t_df[["Combo", "CAGR", "MaxDD", "Sharpe", "Ann Vol", "Avg Mon Return"]].copy()
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            # Best combo callout
+            best_row = t_df.loc[t_df["_sharpe"].idxmax()]
+            st.success(f"Best Sharpe: **{best_row['Combo']}** — Sharpe {best_row['Sharpe']}, CAGR {best_row['CAGR']}, MaxDD {best_row['MaxDD']}")
+
+            # Equity curves overlay
+            colors = ["#00E5FF", "#FFD700", "#00FF88", "#FF6B6B"]
+            fig_t = go.Figure()
+            for (label, eq), color in zip(t_curves.items(), colors):
+                fig_t.add_trace(go.Scatter(
+                    x=eq.index, y=eq,
+                    name=label.split(":")[0],
+                    line=dict(color=color, width=1.8),
+                ))
+            fig_t.update_layout(
+                template="plotly_dark",
+                title="Entry Timing Comparison -- Equity Curves (same capital base)",
+                height=420,
+                legend=dict(orientation="h", y=1.02),
+                yaxis_title="Growth of $1",
+            )
+            st.plotly_chart(fig_t, use_container_width=True)
+
+            # Monday return analysis
+            st.markdown("**Avg Monday Return** shows whether Monday tends to help or hurt. "
+                        "Negative = Monday gaps cost you; combos B/C/D skip or delay past that.")
+        else:
+            st.warning("Timing comparison returned no data.")
 
 
 # =======================================================================
