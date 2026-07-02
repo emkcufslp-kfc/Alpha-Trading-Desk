@@ -10,4 +10,4 @@ headless = true
 enableCORS = false
 
 [browser]
-gatherUsageStats = false
+gatherUsageSt

@@ -24,4 +24,3 @@ results/*.json
 Thumbs.db
 
 # Streamlit
-.streamlit/secrets.toml
