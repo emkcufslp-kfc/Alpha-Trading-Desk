@@ -1294,17 +1294,6 @@ with tab_opt:
                     title="Cross-Sectional Growth Profile (Daily Z-Score Ranking)", height=450)
                 st.plotly_chart(fig_xs, use_container_width=True)
 
-                # Lead-lag analysis
-                st.markdown("##### Lead-Lag Cross-Correlation")
-                if st.button("Run Lead-Lag Analysis", key="xs_ll"):
-                    with st.spinner("Computing cross-correlations..."):
-                        ll = run_lead_lag_pipeline(xs_prices, max_lag=10)
-                    fig_ll = go.Figure()
-                    for col in ll.columns[:5]:
-                        fig_ll.add_trace(go.Scatter(x=ll.index, y=ll[col], name=col))
-                    fig_ll.update_layout(template="plotly_dark",
-                        title="Top-5 Cross-Correlations vs Universe Avg", height=350)
-                    st.plotly_chart(fig_ll, use_container_width=True)
             else:
                 st.warning("No price data returned.")
 
