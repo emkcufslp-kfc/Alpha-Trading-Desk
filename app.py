@@ -1235,7 +1235,7 @@ with tab_action:
             if not sig["mom_table"].empty:
                 mom_display = sig["mom_table"].head(15).reset_index()
                 mom_display.columns = ["Ticker", "11-1 Wk Momentum"]
-                mom_display["12-1 Mo Momentum"] = mom_display["12-1 Mo Momentum"].map("{:.2%}".format)
+                mom_display["11-1 Wk Momentum"] = mom_display["11-1 Wk Momentum"].map("{:.2%}".format)
                 mom_display["Rank"] = range(1, len(mom_display) + 1)
                 mom_display["In Portfolio"] = mom_display["Ticker"].apply(
                     lambda t: "⭐ Selected" if t in top_tickers else
